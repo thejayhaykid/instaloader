@@ -17,16 +17,17 @@ PostSidecarNode.is_video.__doc__ = "Whether this node is a video."
 PostSidecarNode.display_url.__doc__ = "URL of image or video thumbnail."
 PostSidecarNode.video_url.__doc__ = "URL of video or None."
 
-PostCommentAnswer = namedtuple('PostCommentAnswer', ['id', 'created_at_utc', 'text', 'owner'])
+PostCommentAnswer = namedtuple('PostCommentAnswer', ['id', 'created_at_utc', 'text', 'owner', 'likes_count'])
 PostCommentAnswer.id.__doc__ = "ID number of comment."
 PostCommentAnswer.created_at_utc.__doc__ = ":class:`~datetime.datetime` when comment was created (UTC)."
 PostCommentAnswer.text.__doc__ = "Comment text."
 PostCommentAnswer.owner.__doc__ = "Owner :class:`Profile` of the comment."
+PostCommentAnswer.likes_count.__doc__ = "Number of likes on comment."
 
-PostComment = namedtuple('PostComment', (*PostCommentAnswer._fields, 'answers'))
+PostComment = namedtuple('PostComment', (*PostCommentAnswer._fields, 'answers')) # type: ignore
 for field in PostCommentAnswer._fields:
     getattr(PostComment, field).__doc__ = getattr(PostCommentAnswer, field).__doc__
-PostComment.answers.__doc__ = r"Iterator which yields all :class:`PostCommentAnswer`\ s for the comment."
+PostComment.answers.__doc__ = r"Iterator which yields all :class:`PostCommentAnswer`\ s for the comment." # type: ignore
 
 PostLocation = namedtuple('PostLocation', ['id', 'name', 'slug', 'has_public_page', 'lat', 'lng'])
 PostLocation.id.__doc__ = "ID number of location."
@@ -67,9 +68,9 @@ class Post:
         self._context = context
         self._node = node
         self._owner_profile = owner_profile
-        self._full_metadata_dict = None
-        self._rhx_gis_str = None
-        self._location = None
+        self._full_metadata_dict = None  # type: Optional[Dict[str, Any]]
+        self._rhx_gis_str = None         # type: Optional[str]
+        self._location = None            # type: Optional[PostLocation]
 
     @classmethod
     def from_shortcode(cls, context: InstaloaderContext, shortcode: str):
@@ -132,7 +133,7 @@ class Post:
         if not self._full_metadata_dict:
             pic_json = self._context.get_json("p/{0}/".format(self.shortcode), params={})
             self._full_metadata_dict = pic_json['entry_data']['PostPage'][0]['graphql']['shortcode_media']
-            self._rhx_gis_str = pic_json['rhx_gis']
+            self._rhx_gis_str = pic_json.get('rhx_gis')
             if self.shortcode != self._full_metadata_dict['shortcode']:
                 self._node.update(self._full_metadata_dict)
                 raise PostChangedException
@@ -140,10 +141,11 @@ class Post:
     @property
     def _full_metadata(self) -> Dict[str, Any]:
         self._obtain_metadata()
+        assert self._full_metadata_dict is not None
         return self._full_metadata_dict
 
     @property
-    def _rhx_gis(self) -> str:
+    def _rhx_gis(self) -> Optional[str]:
         self._obtain_metadata()
         return self._rhx_gis_str
 
@@ -188,12 +190,16 @@ class Post:
     @property
     def date_local(self) -> datetime:
         """Timestamp when the post was created (local time zone)."""
-        return datetime.fromtimestamp(self._node["date"] if "date" in self._node else self._node["taken_at_timestamp"])
+        return datetime.fromtimestamp(self._node["date"]
+                                      if "date" in self._node
+                                      else self._node["taken_at_timestamp"])
 
     @property
     def date_utc(self) -> datetime:
         """Timestamp when the post was created (UTC)."""
-        return datetime.utcfromtimestamp(self._node["date"] if "date" in self._node else self._node["taken_at_timestamp"])
+        return datetime.utcfromtimestamp(self._node["date"]
+                                         if "date" in self._node
+                                         else self._node["taken_at_timestamp"])
 
     @property
     def date(self) -> datetime:
@@ -231,6 +237,7 @@ class Post:
             return self._node["edge_media_to_caption"]["edges"][0]["node"]["text"]
         elif "caption" in self._node:
             return self._node["caption"]
+        return None
 
     @property
     def caption_hashtags(self) -> List[str]:
@@ -253,6 +260,16 @@ class Post:
         return re.findall(mention_regex, self.caption.lower())
 
     @property
+    def pcaption(self) -> str:
+        """Printable caption, useful as a format specifier for --filename-pattern.
+
+        .. versionadded:: 4.2.6"""
+        def _elliptify(caption):
+            pcaption = ' '.join([s.replace('/', '\u2215') for s in caption.splitlines() if s]).strip()
+            return (pcaption[:30] + u"\u2026") if len(pcaption) > 31 else pcaption
+        return _elliptify(self.caption) if self.caption else ''
+
+    @property
     def tagged_users(self) -> List[str]:
         """List of all lowercased users that are tagged in the Post."""
         try:
@@ -271,6 +288,25 @@ class Post:
         """URL of the video, or None."""
         if self.is_video:
             return self._field('video_url')
+        return None
+
+    @property
+    def video_view_count(self) -> Optional[int]:
+        """View count of the video, or None.
+
+        .. versionadded:: 4.2.6"""
+        if self.is_video:
+            return self._field('video_view_count')
+        return None
+
+    @property
+    def video_duration(self) -> Optional[float]:
+        """Duration of the video in seconds, or None.
+
+        .. versionadded:: 4.2.6"""
+        if self.is_video:
+            return self._field('video_duration')
+        return None
 
     @property
     def viewer_has_liked(self) -> Optional[bool]:
@@ -305,7 +341,8 @@ class Post:
             return PostCommentAnswer(id=int(node['id']),
                                      created_at_utc=datetime.utcfromtimestamp(node['created_at']),
                                      text=node['text'],
-                                     owner=Profile(self._context, node['owner']))
+                                     owner=Profile(self._context, node['owner']),
+                                     likes_count=node['edge_liked_by']['count'])
 
         def _postcommentanswers(node):
             if 'edge_threaded_comments' not in node:
@@ -373,10 +410,17 @@ class Post:
 
     @property
     def location(self) -> Optional[PostLocation]:
-        """If the Post has a location, returns PostLocation namedtuple with fields 'id', 'lat' and 'lng' and 'name'."""
+        """
+        If the Post has a location, returns PostLocation namedtuple with fields 'id', 'lat' and 'lng' and 'name'.
+
+        .. versionchanged:: 4.2.9
+           Require being logged in (as required by Instagram), return None if not logged-in.
+        """
         loc = self._field("location")
         if self._location or not loc:
             return self._location
+        if not self._context.is_logged_in:
+            return None
         location_id = int(loc['id'])
         if any(k not in loc for k in ('name', 'slug', 'has_public_page', 'lat', 'lng')):
             loc = self._context.get_json("explore/locations/{0}/".format(location_id),
@@ -416,8 +460,9 @@ class Profile:
     def __init__(self, context: InstaloaderContext, node: Dict[str, Any]):
         assert 'username' in node
         self._context = context
-        self._has_public_story = None
+        self._has_public_story = None  # type: Optional[bool]
         self._node = node
+        self._has_full_metadata = False
         self._rhx_gis = None
         self._iphone_struct_ = None
         if 'iphone_struct' in node:
@@ -478,10 +523,11 @@ class Profile:
 
     def _obtain_metadata(self):
         try:
-            if not self._rhx_gis:
+            if not self._has_full_metadata:
                 metadata = self._context.get_json('{}/'.format(self.username), params={})
                 self._node = metadata['entry_data']['ProfilePage'][0]['graphql']['user']
-                self._rhx_gis = metadata['rhx_gis']
+                self._has_full_metadata = True
+                self._rhx_gis = metadata.get('rhx_gis')
         except (QueryReturnedNotFoundException, KeyError) as err:
             raise ProfileNotExistsException('Profile {} does not exist.'.format(self.username)) from err
 
@@ -596,6 +642,7 @@ class Profile:
                                                        'https://www.instagram.com/{}/'.format(self.username),
                                                        self._rhx_gis)
             self._has_public_story = data['data']['user']['has_public_story']
+        assert self._has_public_story is not None
         return self._has_public_story
 
     @property
@@ -762,6 +809,7 @@ class StoryItem:
         """:class:`Profile` instance of the story item's owner."""
         if not self._owner_profile:
             self._owner_profile = Profile.from_id(self._context, self._node['owner']['id'])
+        assert self._owner_profile is not None
         return self._owner_profile
 
     @property
@@ -824,6 +872,7 @@ class StoryItem:
         """URL of the video, or None."""
         if self.is_video:
             return self._node['video_resources'][-1]['src']
+        return None
 
 
 class Story:
@@ -850,8 +899,8 @@ class Story:
     def __init__(self, context: InstaloaderContext, node: Dict[str, Any]):
         self._context = context
         self._node = node
-        self._unique_id = None
-        self._owner_profile = None
+        self._unique_id = None      # type: Optional[str]
+        self._owner_profile = None  # type: Optional[Profile]
 
     def __repr__(self):
         return '<Story by {} changed {:%Y-%m-%d_%H-%M-%S_UTC}>'.format(self.owner_username, self.latest_media_utc)
@@ -865,7 +914,7 @@ class Story:
         return hash(self.unique_id)
 
     @property
-    def unique_id(self) -> str:
+    def unique_id(self) -> Union[str, int]:
         """
         This ID only equals amongst :class:`Story` instances which have the same owner and the same set of
         :class:`StoryItem`. For all other :class:`Story` instances this ID is different.
@@ -881,12 +930,14 @@ class Story:
         """Timestamp when the story has last been watched or None (local time zone)."""
         if self._node['seen']:
             return datetime.fromtimestamp(self._node['seen'])
+        return None
 
     @property
     def last_seen_utc(self) -> Optional[datetime]:
         """Timestamp when the story has last been watched or None (UTC)."""
         if self._node['seen']:
             return datetime.utcfromtimestamp(self._node['seen'])
+        return None
 
     @property
     def latest_media_local(self) -> datetime:
@@ -951,7 +1002,7 @@ class Highlight(Story):
     def __init__(self, context: InstaloaderContext, node: Dict[str, Any], owner: Optional[Profile] = None):
         super().__init__(context, node)
         self._owner_profile = owner
-        self._items = None
+        self._items = None  # type: Optional[List[Dict[str, Any]]]
 
     def __repr__(self):
         return '<Highlight by {}: {}>'.format(self.owner_username, self.title)
@@ -994,11 +1045,13 @@ class Highlight(Story):
     def itemcount(self) -> int:
         """Count of items associated with the :class:`Highlight` instance."""
         self._fetch_items()
+        assert self._items is not None
         return len(self._items)
 
     def get_items(self) -> Iterator[StoryItem]:
         """Retrieve all associated highlight items."""
         self._fetch_items()
+        assert self._items is not None
         yield from (StoryItem(self._context, item, self.owner_profile) for item in self._items)
 
 

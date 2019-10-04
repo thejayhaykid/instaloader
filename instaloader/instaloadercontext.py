@@ -10,7 +10,7 @@ import time
 import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Iterator, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 import requests
 import requests.utils
@@ -22,7 +22,7 @@ def copy_session(session: requests.Session) -> requests.Session:
     """Duplicates a requests.Session."""
     new = requests.Session()
     new.cookies = requests.utils.cookiejar_from_dict(requests.utils.dict_from_cookiejar(session.cookies))
-    new.headers = session.headers.copy()
+    new.headers = session.headers.copy() # type: ignore
     return new
 
 
@@ -60,17 +60,17 @@ class InstaloaderContext:
         self.two_factor_auth_pending = None
 
         # error log, filled with error() and printed at the end of Instaloader.main()
-        self.error_log = []
+        self.error_log = []                      # type: List[str]
 
         # For the adaption of sleep intervals (rate control)
-        self._graphql_query_timestamps = dict()
-        self._graphql_earliest_next_request_time = 0
+        self._graphql_query_timestamps = dict()  # type: Dict[str, List[float]]
+        self._graphql_earliest_next_request_time = 0.0
 
         # Can be set to True for testing, disables supression of InstaloaderContext._error_catcher
         self.raise_all_errors = False
 
         # Cache profile from id (mapping from id to Profile)
-        self.profile_id_cache = dict()
+        self.profile_id_cache = dict()           # type: Dict[int, Any]
 
     @contextmanager
     def anonymous_copy(self):
@@ -181,7 +181,8 @@ class InstaloaderContext:
         :raises InvalidArgumentException: If the provided username does not exist.
         :raises BadCredentialsException: If the provided password is wrong.
         :raises ConnectionException: If connection to Instagram failed.
-        :raises TwoFactorAuthRequiredException: First step of 2FA login done, now call :meth:`Instaloader.two_factor_login`."""
+        :raises TwoFactorAuthRequiredException: First step of 2FA login done, now call
+           :meth:`Instaloader.two_factor_login`."""
         import http.client
         # pylint:disable=protected-access
         http.client._MAXHEADERS = 200
@@ -211,7 +212,7 @@ class InstaloaderContext:
             raise TwoFactorAuthRequiredException("Login error: two-factor authentication required.")
         if resp_json.get('checkpoint_url'):
             raise ConnectionException("Login: Checkpoint required. Point your browser to "
-                                      "https://www.instagram.com{}, "
+                                      "https://www.instagram.com{} - "
                                       "follow the instructions, then retry.".format(resp_json.get('checkpoint_url')))
         if resp_json['status'] != 'ok':
             if 'message' in resp_json:
@@ -278,12 +279,12 @@ class InstaloaderContext:
     def _graphql_request_count_per_sliding_window(self, query_hash: str) -> int:
         """Return how many GraphQL requests can be done within the sliding window."""
         if self.is_logged_in:
-            max_reqs = {'1cb6ec562846122743b61e492c85999f': 20, '33ba35852cb50da46f5b5e889df7d159': 20}
+            max_reqs = {'1cb6ec562846122743b61e492c85999f': 20, '33ba35852cb50da46f5b5e889df7d159': 20, 'iphone': 100}
         else:
             max_reqs = {'1cb6ec562846122743b61e492c85999f': 200, '33ba35852cb50da46f5b5e889df7d159': 200}
         return max_reqs.get(query_hash) or min(max_reqs.values())
 
-    def _graphql_query_waittime(self, query_hash: str, current_time: float, untracked_queries: bool = False) -> int:
+    def _graphql_query_waittime(self, query_hash: str, current_time: float, untracked_queries: bool = False) -> float:
         """Calculate time needed to wait before GraphQL query can be executed."""
         sliding_window = 660
         if query_hash not in self._graphql_query_timestamps:
@@ -345,15 +346,21 @@ class InstaloaderContext:
         :raises ConnectionException: When query repeatedly failed.
         """
         is_graphql_query = 'query_hash' in params and 'graphql/query' in path
+        is_iphone_query = host == 'i.instagram.com'
         sess = session if session else self._session
         try:
             self.do_sleep()
             if is_graphql_query:
                 self._ratecontrol_graphql_query(params['query_hash'])
+            if is_iphone_query:
+                self._ratecontrol_graphql_query('iphone')
             resp = sess.get('https://{0}/{1}'.format(host, path), params=params, allow_redirects=False)
             while resp.is_redirect:
                 redirect_url = resp.headers['location']
                 self.log('\nHTTP redirect from https://{0}/{1} to {2}'.format(host, path, redirect_url))
+                if redirect_url.startswith('https://www.instagram.com/accounts/login'):
+                    # alternate rate limit exceeded behavior
+                    raise TooManyRequestsException("429 Too Many Requests: redirected to login")
                 if redirect_url.startswith('https://{}/'.format(host)):
                     resp = sess.get(redirect_url if redirect_url.endswith('/') else redirect_url + '/',
                                     params=params, allow_redirects=False)
@@ -388,8 +395,10 @@ class InstaloaderContext:
                 raise ConnectionException(error_string) from err
             self.error(error_string + " [retrying; skip with ^C]", repeat_at_end=False)
             try:
-                if isinstance(err, TooManyRequestsException):
+                if is_graphql_query and isinstance(err, TooManyRequestsException):
                     self._ratecontrol_graphql_query(params['query_hash'], untracked_queries=True)
+                if is_iphone_query and isinstance(err, TooManyRequestsException):
+                    self._ratecontrol_graphql_query('iphone', untracked_queries=True)
                 return self.get_json(path=path, params=params, host=host, session=sess, _attempt=_attempt + 1)
             except KeyboardInterrupt:
                 self.error("[skipped by user]", repeat_at_end=False)
@@ -529,6 +538,6 @@ class InstaloaderContext:
             # At the moment, rhx_gis seems to be required for anonymous requests only. By returning None when logged
             # in, we can save the root_rhx_gis lookup query.
             return None
-        if not self._root_rhx_gis:
-            self._root_rhx_gis = self.get_json('', {})['rhx_gis']
-        return self._root_rhx_gis
+        if self._root_rhx_gis is None:
+            self._root_rhx_gis = self.get_json('', {}).get('rhx_gis', '')
+        return self._root_rhx_gis or None

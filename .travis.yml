@@ -1,15 +1,17 @@
+dist: xenial
 language: python
 python:
  - "3.5"
- - "3.5-dev"
  - "3.6"
- - "3.6-dev"
+ - "3.7"
 install:
- - pip install pylint~=2.3.1 requests
- - pip install -r docs/requirements.txt
+ - pipenv sync --dev
 script:
- - python3 -m pylint -r n -d bad-whitespace,missing-docstring,too-many-arguments,locally-disabled,line-too-long,no-else-raise,too-many-public-methods,too-many-lines,too-many-instance-attributes,too-many-locals,too-many-branches,too-many-statements,inconsistent-return-statements,invalid-name,wildcard-import,unused-wildcard-import,no-else-return,cyclic-import,unnecessary-pass instaloader
+ - pylint instaloader
+ - mypy -m instaloader
  - make -C docs html SPHINXOPTS="-W -n"
+addons:
+  ssh_known_hosts: aur.archlinux.org
 deploy:
   - provider: pypi
     user: aandergr
@@ -26,4 +28,9 @@ deploy:
     target-branch: master
     on:
       branch: master
+      python: 3.6
+  - provider: script
+    script: deploy/arch/deploy.sh $TRAVIS_TAG
+    on:
+      tags: true
       python: 3.6
